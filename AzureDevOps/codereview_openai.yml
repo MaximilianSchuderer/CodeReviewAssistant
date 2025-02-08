@@ -1,0 +1,104 @@
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+steps:
+  - script: |
+      BASE_URL="$(System.CollectionUri)$(System.TeamProject)"
+      PR_ID="$(System.PullRequest.PullRequestId)"
+      REPO_NAME="$(Build.Repository.Name)"
+      ASSISTANT_NAME="Paddington Bear"
+      OPENAI_API_KEY=""
+      OPENAI_API_URL=""
+
+      echo "Fetch basic information about repository and branch..."
+      
+      FULL_SOURCE_BRANCH=$(curl -s -u ":$(System.AccessToken)" -H "Content-Type: application/json" \
+      "$BASE_URL/_apis/git/pullrequests/$PR_ID?api-version=6.0" \
+      | jq -r '.sourceRefName')
+      
+      FULL_TARGET_BRANCH=$(curl -s -u ":$(System.AccessToken)" -H "Content-Type: application/json" \
+      "$BASE_URL/_apis/git/pullrequests/$PR_ID?api-version=6.0" \
+      | jq -r '.targetRefName')
+
+      SOURCE_BRANCH=$(echo "$FULL_SOURCE_BRANCH" | sed 's|refs/heads/||')
+      TARGET_BRANCH=$(echo "$FULL_TARGET_BRANCH" | sed 's|refs/heads/||')
+
+      echo "Fetch changes of the branch..."
+
+      PR_URL="$BASE_URL/_apis/git/repositories/$REPO_NAME/pullRequests/$PR_ID/iterations/1/changes?api-version=6.0"
+
+      curl -s -u ":$(System.AccessToken)" -H "Content-Type: application/json" "$PR_URL" | jq -r '[.changeEntries[] | {path: .item.path, operation: .changeType}]' > changes.json
+
+      echo "Start processing the changes..."
+
+      jq -c '.[]' changes.json | while read change; do
+        FILE_PATH=$(echo $change | jq -r '.path')
+        OPERATION=$(echo $change | jq -r '.operation')
+
+        echo "Process operation '$OPERATION' on file '$FILE_PATH'..."
+
+        if [[ "$OPERATION" == "add" ]]; then
+          echo "Fetch content of added file..."
+
+          SOURCE_FILE_URL="$BASE_URL/_apis/git/repositories/$REPO_NAME/items?path=$FILE_PATH&versionDescriptor.version=$SOURCE_BRANCH&api-version=6.0"
+
+          NEW_CONTENT=$(curl -s -u ":$(System.AccessToken)" -H "Content-Type: application/json" "$SOURCE_FILE_URL")
+        
+          PROMPT=$(jq -n --arg fc "$NEW_CONTENT" '{model: "gpt-3.5-turbo", messages: [{role: "system", content: "You are a senior software engineer reviewing a pull request."}, {role: "user", content: "The following is a newly added file. Provide comments on potential improvements, code quality, and best practices. Return results in JSON format:\n\n{\"comments\": [{ \"line\": <line_number>, \"comment\": \"<issue>\", \"suggestion\": \"<fix>\" }]}\n\nFile Content:\n\n\($fc)"}], temperature: 0.3 }')
+
+        elif [[ "$OPERATION" == "edit" ]]; then
+          echo "Fetch content of original file..."
+          
+          TARGET_FILE_URL="$BASE_URL/_apis/git/repositories/$REPO_NAME/items?path=$FILE_PATH&versionDescriptor.version=$TARGET_BRANCH&api-version=6.0"
+          
+          ORIGINAL_CONTENT=$(curl -s -u ":$(System.AccessToken)" -H "Content-Type: application/json" "$TARGET_FILE_URL")
+
+          echo "Fetch content of modified file..."
+
+          SOURCE_FILE_URL="$BASE_URL/_apis/git/repositories/$REPO_NAME/items?path=$FILE_PATH&versionDescriptor.version=$SOURCE_BRANCH&api-version=6.0"
+
+          NEW_CONTENT=$(curl -s -u ":$(System.AccessToken)" -H "Content-Type: application/json" "$SOURCE_FILE_URL")
+
+          PROMPT=$(jq -n --arg sc "$ORIGINAL_CONTENT" --arg tc "$NEW_CONTENT" '{model: "gpt-3.5-turbo", messages: [{role: "system", content: "You are a highly skilled software engineer reviewing a pull request."}, {role: "user", content: "The following file has been modified. Focus on the changes and provide feedback on potential improvements, performance, and best practices. Return results in JSON format:\n\n{\"comments\": [{ \"line\": <line_number>, \"comment\": \"<issue>\", \"suggestion\": \"<fix>\" }]}\n\nOriginal Code:\n\n\($sc)\n\nUpdated Code:\n\n\($tc)"}], temperature: 0.3 }')
+        fi
+
+        echo "Process code changes with AI assistant..."
+        
+        RESPONSE=$(curl -s -X POST "$OPENAI_API_URL" \
+        -H "Authorization: Bearer $OPENAI_API_KEY" \
+        -H "Content-Type: application/json" \
+        -d "$PROMPT")
+
+        COMMENTS=$(echo "${RESPONSE}" | jq -r '.choices[0].message.content' | jq '.comments')
+
+        echo "Create comments in PR..."
+
+        echo "${COMMENTS}" | jq -c '.[]' | while read -r row; do
+          LINE_NUMBER=$(echo "$row" | jq -r '.line')
+          COMMENT_TEXT=$(echo "$row" | jq -r '.comment')
+          SUGGESTION=$(echo "$row" | jq -r '.suggestion')
+
+          EXISTING_COMMENTS=$(curl -s -X GET "$BASE_URL/_apis/git/repositories/$REPO_NAME/pullRequests/$PR_ID/threads?api-version=6.0" \
+          -u ":$(System.AccessToken)" \
+          -H "Content-Type: application/json" | jq -c '.value[] | {filePath: .threadContext.filePath, line: .threadContext.rightFileStart.line, content: .comments[0].content}')
+
+          COMMENT_EXISTS=$(echo "$EXISTING_COMMENTS" | jq --arg filePath "$FILE_PATH" --argjson line "$LINE_NUMBER" --arg content "$COMMENT_BODY" 'select(.filePath == $filePath and .line == $line)')
+
+          if [[ -z "$COMMENT_EXISTS" ]]; then
+            COMMENT_BODY=$(printf "%s\n\n\n*Suggestion:* %s" "**$ASSISTANT_NAME:** $COMMENT_TEXT" "$SUGGESTION")
+
+            JSON_PAYLOAD=$(jq -n --arg content "$COMMENT_BODY" --arg filePath "$FILE_PATH" --argjson line "$LINE_NUMBER" --argjson offset 1 '{comments: [{parentCommentId: 0, content: $content, commentType: "text"}], status: "active", threadContext: {filePath: $filePath, rightFileStart: {line: $line, offset: $offset}, rightFileEnd: {line: $line, offset: $offset}}}')
+
+            AZURE_RESPONSE=$(curl -s -X POST "$BASE_URL/_apis/git/repositories/$REPO_NAME/pullRequests/$PR_ID/threads?api-version=6.0" \
+            -u ":$(System.AccessToken)" \
+            -H "Content-Type: application/json" \
+            -d "$JSON_PAYLOAD")
+          fi
+        done
+      done
+
+      echo "AI code review done"
+
+    displayName: "AI-Codereview"
